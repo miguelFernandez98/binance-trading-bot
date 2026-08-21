@@ -12,16 +12,25 @@ En ambos modos:
   MAX_OPEN posiciones simultaneas).
 - Cada posicion abre con Stop-Loss y Take-Profit obligatorios (OCO, con
   fallback a TP limit + SL stop-limit separados y salida de emergencia).
+- SL DINAMICO: se adapta a la volatilidad de cada par (monedas volatilas
+  obtienen SL mas amplio para no liquidarse prematuramente).
+- FILTRO BTC: si BTC cae mas de un umbral, bloquea entradas en altcoins.
+- CONFIRMACION DE VOLUMEN: el retroceso debe tener volumen bajo (consolidacion
+  saludable, no reversal).
+- COOLDOWN: no re-entra inmediatamente en un par tras cerrar operacion.
 - Respeta filtros del exchange: LOT_SIZE, PRICE_FILTER (tick) y MIN_NOTIONAL.
 - Descuenta comisiones de Binance (0.1% compra + 0.1% venta).
 - Credenciales leidas desde .env (python-dotenv).
 - Persistencia en state.json y compensacion automatica de reloj (-1021).
+- Entrada interactiva con -i: pide capital y horas al iniciar.
 - Reporte final en consola.
 
 USO:
-    python bot.py --testnet                                  # radar dinamico
+    python bot.py --testnet                                  # radar momentum
+    python bot.py --testnet -i                               # pide datos por consola
     python bot.py --strategy dip --symbols BTCUSDT,ETHUSDT   # lista fija
-    python bot.py --top-n 8 --min-volume 50000000            # radar mas amplio
+    python bot.py --rr 2.0 --btc-threshold -1.0              # filtros estrictos
+    python bot.py --cooldown 30 --volatility-sl 1.5          # cooldown + SL dinamico
     python bot.py --capital 90 --max-open 3                  # 30 USDT por operacion
     python bot.py --reset                                    # ignora state.json
 
@@ -61,8 +70,12 @@ MAX_OPEN_POSITIONS = 3          # Posiciones simultaneas (capital/max_open = USD
 RECOVERY_FACTOR = 1.0           # Multiplicador de tamano tras perdida (1 = desactivado; ej. 1.5)
 RECOVERY_MAX_STEPS = 3          # Maximos pasos de recuperacion consecutivos
 BUY_DROP_PERCENT = 0.5          # % de caida respecto al precio base para comprar
-STOP_LOSS_PERCENT = 1.0         # % de Stop-Loss
-TAKE_PROFIT_PERCENT = 1.5       # % de Take-Profit
+STOP_LOSS_PERCENT = 1.0         # % de Stop-Loss base
+TAKE_PROFIT_PERCENT = 1.5       # % de Take-Profit base
+RISK_REWARD_RATIO = 1.5         # TP = SL * ratio (minimo 1.0)
+VOLATILITY_SL_MULT = 1.0        # Multiplicador de SL segun volatilidad (1.0 = base * vol)
+BTC_TREND_THRESHOLD = -0.5      # Si BTC cae mas de este %, bloquea entradas en altcoins
+COOLDOWN_MINUTES = 15           # Minutos de espera tras cerrar una operacion en un par
 MONITOR_INTERVAL = 5            # Segundos entre cada escaneo
 DURATION_MINUTES = 60           # Duracion total en minutos (0 = ilimitada)
 MAX_TRADES = 10                 # Numero maximo de operaciones totales (0 = ilimitadas)
@@ -149,6 +162,87 @@ def base_asset(symbol):
         if symbol.endswith(q) and len(symbol) > len(q):
             return symbol[: -len(q)]
     return symbol[:-4]
+
+
+# ---------------------------------------------------------------------------
+# Filtros de calidad de entrada
+# ---------------------------------------------------------------------------
+def get_btc_trend(client):
+    """Devuelve el cambio porcentual de BTC en 24h. Negativo = BTC cayendo."""
+    try:
+        ticker = client.get_symbol_ticker(symbol="BTCUSDT")
+        return D(ticker["price"])
+    except Exception:
+        return None
+
+
+def check_btc_trend(client, threshold):
+    """True si BTC esta cayendo mas del umbral (bloquea entradas en altcoins)."""
+    try:
+        t = _get_scan_client().get_ticker()
+        for ticker in t:
+            if ticker["symbol"] == "BTCUSDT":
+                change = D(ticker["priceChangePercent"])
+                if change < D(threshold):
+                    logger.warning(
+                        f"BTC cayendo {fmt(change, 2)}% (umbral {threshold}%). "
+                        "Entradas en altcoins BLOQUEADAS."
+                    )
+                    return True
+                return False
+    except Exception:
+        pass
+    return False
+
+
+def check_volume_pullback(client, symbol, ref_volume):
+    """
+    True si el volumen actual es MENOR que el de referencia (pullback sano).
+    Un retroceso con volumen bajo = consolidacion saludable, no reversal.
+    """
+    try:
+        tickers = _get_scan_client().get_ticker()
+        for t in tickers:
+            if t["symbol"] == symbol:
+                current_vol = D(t["quoteVolume"])
+                if ref_volume and ref_volume > 0:
+                    ratio = current_vol / ref_volume
+                    if ratio > D("1.2"):
+                        # Volumen subio >20% durante el retroceso = sospechoso
+                        logger.info(
+                            f"[{symbol}] Volumen subio {fmt((ratio - 1) * 100, 1)}% "
+                            "durante retroceso (posible reversal). Se omite."
+                        )
+                        return False
+                return True
+    except Exception:
+        pass
+    return True
+
+
+def compute_dynamic_sl(base_sl, price_change_24h):
+    """
+    SL dinamico basado en volatilidad del par.
+    Si una moneda se mueve +15% en 24h, un SL fijo del 1% se liquidara seguro.
+    SL dinamico = base_sl + (volatilidad * multiplicador), con tope en MAX_SL.
+    """
+    MAX_SL = D("3.0")  # tope absoluto de SL
+    volatility = abs(price_change_24h)
+    dynamic = D(base_sl) + (volatility * D(VOLATILITY_SL_MULT) / Decimal(10))
+    return min(dynamic, MAX_SL)
+
+
+def compute_dynamic_tp(sl_pct, ratio):
+    """TP basado en SL y risk-reward ratio configurado."""
+    return sl_pct * D(ratio)
+
+
+def is_on_cooldown(symbol, trade_closes):
+    """True si el par esta en cooldown (trade reciente cerrado)."""
+    if symbol not in trade_closes:
+        return False
+    elapsed = time.time() - trade_closes[symbol]
+    return elapsed < COOLDOWN_MINUTES * 60
 
 
 # ---------------------------------------------------------------------------
@@ -665,7 +759,7 @@ NUMERIC_KEYS = {"qty", "spend", "buy_price", "stop_price", "take_price", "capita
 ID_KEYS = {"tp_id", "sl_id"}
 
 
-def save_state(trades, active, bases, consec_losses=0):
+def save_state(trades, active, bases, consec_losses=0, ref_volumes=None, trade_closes=None):
     try:
         data = {
             "format": "multi",
@@ -674,6 +768,8 @@ def save_state(trades, active, bases, consec_losses=0):
             "bases": {s: {"base": str(b["base"]), "trigger": str(b["trigger"])}
                       for s, b in bases.items()},
             "consec_losses": consec_losses,
+            "ref_volumes": ref_volumes or {},
+            "trade_closes": trade_closes or {},
         }
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, default=str)
@@ -725,6 +821,8 @@ def load_state():
     data.setdefault("active", {})
     data.setdefault("bases", {})
     data.setdefault("consec_losses", 0)
+    data.setdefault("ref_volumes", {})
+    data.setdefault("trade_closes", {})
     return data
 
 
@@ -748,6 +846,14 @@ def parse_args():
                         "Nunca supera el capital total asignado")
     p.add_argument("--recovery-max", type=int, default=RECOVERY_MAX_STEPS,
                    help="Maximos pasos de recuperacion consecutivos")
+    p.add_argument("--rr", type=float, default=RISK_REWARD_RATIO,
+                   help="Risk-reward ratio: TP = SL * rr (default 1.5)")
+    p.add_argument("--btc-threshold", type=float, default=BTC_TREND_THRESHOLD,
+                   help="Si BTC cae mas de este porcentaje, bloquea entradas en altcoins (-0.5)")
+    p.add_argument("--cooldown", type=int, default=COOLDOWN_MINUTES,
+                   help="Minutos de espera tras cerrar un trade en un par (15)")
+    p.add_argument("--volatility-sl", type=float, default=VOLATILITY_SL_MULT,
+                   help="Multiplicador de SL segun volatilidad (1.0 = adaptativo)")
     p.add_argument("--duration", type=int, default=DURATION_MINUTES,
                    help="Minutos de operacion (0 = ilimitado)")
     p.add_argument("--max-trades", type=int, default=MAX_TRADES,
@@ -770,7 +876,53 @@ def parse_args():
                    help="Subida 24h maxima %% (evita perseguir pumps)")
     p.add_argument("--testnet", action="store_true", help="Usar testnet (sin dinero real)")
     p.add_argument("--reset", action="store_true", help="Ignorar/borrar state.json previo")
+    p.add_argument("--interactive", "-i", action="store_true",
+                   help="Pedir capital y horas de operacion por consola al iniciar")
     return p.parse_args()
+
+
+def _interactive_setup():
+    """Pide al usuario capital y horas de operacion por consola."""
+    print("\n" + "=" * 50)
+    print("  CONFIGURACION DEL BOT DE TRADING")
+    print("=" * 50)
+
+    # Capital
+    while True:
+        raw = input(f"\nCapital a invertir (USDT) [{CFG['capital']}] : ").strip()
+        if not raw:
+            break
+        try:
+            val = float(raw)
+            if val <= 0:
+                print("  El capital debe ser mayor a 0.")
+                continue
+            CFG["capital"] = val
+            break
+        except ValueError:
+            print("  Ingresa un numero valido.")
+
+    # Duracion
+    while True:
+        raw = input(f"Horas de operacion [{CFG['duration'] / 60:.1f}h] : ").strip()
+        if not raw:
+            break
+        try:
+            val = float(raw)
+            if val < 0:
+                print("  Las horas no pueden ser negativas.")
+                continue
+            CFG["duration"] = int(val * 60) if val > 0 else 0
+            break
+        except ValueError:
+            print("  Ingresa un numero valido.")
+
+    # Resumen
+    base = CFG["capital"] / CFG["max_open"]
+    dur = f"{CFG['duration'] / 60:.1f}h" if CFG["duration"] > 0 else "ilimitada"
+    print(f"\n  Resumen: {CFG['capital']:.2f} USDT | {dur} | "
+          f"{base:.2f} USDT/operacion | max {CFG['max_open']} simultaneas")
+    print("=" * 50 + "\n")
 
 
 def main():
@@ -791,6 +943,8 @@ def main():
         top_n=max(1, args.top_n), min_change=args.min_change, max_change=args.max_change,
         capital=args.capital, max_open=max(1, args.max_open),
         recovery=args.recovery, recovery_max=max(0, args.recovery_max),
+        rr=args.rr, btc_threshold=args.btc_threshold,
+        cooldown=max(0, args.cooldown), volatility_sl=args.volatility_sl,
         duration=args.duration, max_trades=args.max_trades, drop=args.drop,
         sl=args.sl, tp=args.tp, interval=args.interval, testnet=args.testnet,
     )
@@ -798,6 +952,15 @@ def main():
     if args.reset and os.path.exists(STATE_FILE):
         os.remove(STATE_FILE)
         logger.info("Estado anterior borrado (--reset).")
+
+    # Entrada interactiva: si no se especificaron --capital y --duration por CLI
+    if not args.interactive:
+        logger.info(
+            f"Configuracion: capital={CFG['capital']} USDT | duracion={CFG['duration']} min | "
+            f"estrategia={CFG['strategy']} | testnet={CFG['testnet']}"
+        )
+    else:
+        _interactive_setup()
 
     client, _testnet = load_config()
 
@@ -847,6 +1010,8 @@ def main():
         active = state["active"]
         bases = state["bases"]
         consec_losses = int(state.get("consec_losses") or 0)
+        ref_volumes = state.get("ref_volumes") or {}
+        trade_closes = state.get("trade_closes") or {}
         logger.warning(
             f"Sesion anterior restaurada: {len(active)} posicion(es) abierta(s) "
             f"({', '.join(active.keys()) if active else 'ninguna'})."
@@ -854,9 +1019,10 @@ def main():
     else:
         trades, active, bases = [], {}, {}
         consec_losses = 0
+        ref_volumes = {}
+        trade_closes = {}
         if CFG["strategy"] == "momentum":
             for w in watch:
-                # referencia con el precio del entorno donde se ejecutan ordenes
                 try:
                     p = get_current_price(client, w["symbol"])
                 except Exception:
@@ -865,6 +1031,7 @@ def main():
                     "base": p,
                     "trigger": p * (Decimal(1) - D(CFG["drop"]) / Decimal(100)),
                 }
+                ref_volumes[w["symbol"]] = w["quote_volume"]
         else:
             for s in symbols:
                 p = get_current_price(client, s)
@@ -883,7 +1050,9 @@ def main():
         if s in bases:
             logger.info(f"  {s}: base {fmt(bases[s]['base'])} -> compra a <= {fmt(bases[s]['trigger'])} (-{CFG['drop']}%)")
     logger.info(
-        f"SL -{CFG['sl']}% / TP +{CFG['tp']}% | capital total {fmt(initial_capital, 2)} USDT | "
+        f"SL -{CFG['sl']}% / TP +{CFG['tp']}% (rr={CFG['rr']}) | "
+        f"BTC threshold {CFG['btc_threshold']}% | cooldown {CFG['cooldown']} min | "
+        f"capital total {fmt(initial_capital, 2)} USDT | "
         f"{fmt(base_size, 2)} USDT por operacion | max {CFG['max_open']} simultaneas | "
         f"max {CFG['max_trades'] or 'inf'} ops | duracion {CFG['duration'] or 'inf'} min"
     )
@@ -928,13 +1097,14 @@ def main():
                         "base": p,
                         "trigger": p * (Decimal(1) - D(CFG["drop"]) / Decimal(100)),
                     }
+                    ref_volumes[s] = w["quote_volume"]
                 for s in list(bases.keys()):
                     if s not in watch_syms and s not in active:
                         del bases[s]
                 symbols = [w["symbol"] for w in watch] + \
                     [s for s in active if s not in watch_syms]
                 next_scan = time.time() + CFG["scan_interval"] * 60
-                save_state(trades, active, bases, consec_losses)
+                save_state(trades, active, bases, consec_losses, ref_volumes, trade_closes)
 
             try:
                 # 1) Gestionar posiciones abiertas (detectar TP/SL ejecutados)
@@ -951,9 +1121,11 @@ def main():
                             f"PnL: {fmt(trade['pnl'], 2)} USDT"
                         )
                         consec_losses = consec_losses + 1 if outcome == "loss" else 0
+                        trade_closes[sym] = time.time()  # cooldown
                         del active[sym]
                         refresh_base(sym, get_current_price(client, sym))
-                        save_state(trades, active, bases, consec_losses)
+                        save_state(trades, active, bases, consec_losses,
+                                   ref_volumes, trade_closes)
 
                 # 2) Buscar nuevas entradas si hay slot libre
                 if len(active) < CFG["max_open"]:
@@ -975,6 +1147,11 @@ def main():
                             f"(expuesto {fmt(exposed, 2)}/{fmt(initial_capital, 2)} USDT)."
                         )
                     else:
+                        # Filtro BTC: si BTC se desploma, no entrar en altcoins
+                        btc_ok = not check_btc_trend(client, CFG["btc_threshold"])
+                        if not btc_ok:
+                            logger.info("Entradas pausadas por tendencia BTC negativa.")
+
                         monitor_parts = []
                         for sym in symbols:
                             if sym in active:
@@ -983,6 +1160,11 @@ def main():
                                 break
                             if len(active) >= CFG["max_open"]:
                                 break
+                            # Cooldown: no re-entrar inmediatamente en un par
+                            if is_on_cooldown(sym, trade_closes):
+                                remaining = COOLDOWN_MINUTES * 60 - (time.time() - trade_closes.get(sym, 0))
+                                monitor_parts.append(f"{sym} (cooldown {int(remaining / 60)}m)")
+                                continue
 
                             price = get_current_price(client, sym)
                             ref = bases.get(sym)
@@ -990,16 +1172,41 @@ def main():
                                 refresh_base(sym, price)
                                 ref = bases[sym]
 
-                            if price <= ref["trigger"]:
+                            if price <= ref["trigger"] and btc_ok:
+                                # Filtro de volumen: pullback sano = volumen bajo
+                                ref_vol = ref_volumes.get(sym)
+                                if ref_vol and not check_volume_pullback(client, sym, ref_vol):
+                                    continue
+
+                                # SL/TP dinamicos segun volatilidad del par
+                                try:
+                                    tickers = _get_scan_client().get_ticker()
+                                    vol_change = D("0")
+                                    for t in tickers:
+                                        if t["symbol"] == sym:
+                                            vol_change = D(t["priceChangePercent"])
+                                            break
+                                except Exception:
+                                    vol_change = D(CFG["drop"])
+
+                                dyn_sl = compute_dynamic_sl(CFG["sl"], vol_change)
+                                dyn_tp = compute_dynamic_tp(dyn_sl, CFG["rr"])
+
                                 logger.info(
-                                    f"[{sym}] Precio {fmt(price)} <= umbral {fmt(ref['trigger'])}. Abriendo posicion..."
+                                    f"[{sym}] Precio {fmt(price)} <= umbral {fmt(ref['trigger'])}. "
+                                    f"SL dinamico -{fmt(dyn_sl, 2)}% / TP +{fmt(dyn_tp, 2)}% "
+                                    f"(vol 24h: {fmt(vol_change, 2)}%)"
                                 )
-                                trade = execute_trade(client, symbol=sym, capital=entry_size)
+                                trade = execute_trade(
+                                    client, symbol=sym, capital=entry_size,
+                                    stop_loss_pct=float(dyn_sl), take_profit_pct=float(dyn_tp),
+                                )
                                 if trade:
                                     trades.append(trade)
                                     active[sym] = trade
                                     refresh_base(sym, trade["buy_price"])
-                                    save_state(trades, active, bases, consec_losses)
+                                    save_state(trades, active, bases, consec_losses,
+                                               ref_volumes, trade_closes)
                                     if len(active) >= CFG["max_open"]:
                                         break
                                 else:
@@ -1030,7 +1237,7 @@ def main():
             except Exception:
                 pass
         generate_report(initial_capital, trades, current_prices)
-        save_state(trades, active, bases, consec_losses)
+        save_state(trades, active, bases, consec_losses, ref_volumes, trade_closes)
 
 
 if __name__ == "__main__":
