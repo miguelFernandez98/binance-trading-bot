@@ -52,18 +52,33 @@ Todos los parámetros se editan como constantes al inicio de `bot.py` o por lín
 | `MAX_24H_CHANGE` / `--max-change` | Subida 24h máxima % (evita perseguir pumps) | `25` |
 | `RECOVERY_FACTOR` / `--recovery` | Multiplicador de tamaño tras pérdida (1 = desactivado) | `1.5` |
 | `RECOVERY_MAX_STEPS` / `--recovery-max` | Máximos pasos de recuperación consecutivos | `3` |
+| `RISK_REWARD_RATIO` / `--rr` | Ratio TP/SL (TP = SL × rr) | `1.5` |
+| `BTC_TREND_THRESHOLD` / `--btc-threshold` | Si BTC cae más de este %, bloquea entradas en altcoins | `-0.5` |
+| `COOLDOWN_MINUTES` / `--cooldown` | Minutos de espera tras cerrar un trade en un par | `15` |
+| `VOLATILITY_SL_MULT` / `--volatility-sl` | Multiplicador de SL según volatilidad | `1.0` |
 | `USE_TESTNET` / `--testnet` | Modo simulación sin dinero real | `False` |
 
 ## Uso
 
 ```bash
 python bot.py --testnet                                  # radar momentum (recomendado)
+python bot.py --testnet -i                               # pide capital y horas por consola
 python bot.py --strategy dip --symbols BTCUSDT,ETHUSDT   # lista fija de pares
+python bot.py --rr 2.0 --btc-threshold -1.0              # filtros estrictos
+python bot.py --cooldown 30 --volatility-sl 1.5          # cooldown mayor + SL dinamico
 python bot.py --top-n 8 --min-volume 50000000            # radar mas amplio/exigente
 python bot.py --capital 90 --max-open 3                  # 30 USDT por operacion
 python bot.py --duration 30 --max-trades 6               # limites de sesion
 python bot.py --reset                                    # ignora state.json previo
 ```
+
+### Entrada interactiva
+
+Con `-i` o `--interactive`, el bot te pide al iniciar:
+- **Capital a invertir** (USDT)
+- **Horas de operacion**
+
+Útil para no tener que recordar los flags cada vez.
 
 ### Como funciona el modo MOMENTUM
 
@@ -73,6 +88,16 @@ python bot.py --reset                                    # ignora state.json pre
 4. Los mejores `--top-n` candidatos entran al radar con su precio de referencia.
 5. Compra cuando el precio retrocede `--drop`% desde esa referencia (no persigue la subida: espera un respiro), con SL/TP inmediatos.
 6. El radar se renueva solo: si una cripto deja de estar en subida, sale; entra la siguiente.
+
+### Filtros de seguridad (minimizar perdidas)
+
+El bot aplica **5 filtros antes de cada entrada** para reducir la probabilidad de perdida:
+
+1. **Filtro BTC** (`--btc-threshold`): si BTC cae más del umbral (-0.5% por defecto), no entra en altcoins. Evita comprar en medio de un desplome del mercado.
+2. **Confirmación de volumen**: si el volumen SUBE durante el retroceso, es posible una reversal (no una consolidación sana). El bot lo descarta.
+3. **SL dinámico** (`--volatility-sl`): monedas con alta volatilidad (ej. +15% en 24h) obtienen SL más amplio (-2.5% en vez de -1%) para no liquidarse por ruido normal.
+4. **Cooldown** (`--cooldown`): tras cerrar una operación en un par, espera 15 min antes de re-entrar. Evita re-entradas inmediatas tras una pérdida.
+5. **Risk-reward** (`--rr`): TP siempre es al menos 1.5× el SL. Si el mercado no da suficiente espacio, no entra.
 
 El bot:
 1. Obtiene el precio base de **cada par** al arrancar.
@@ -115,6 +140,10 @@ El bot guarda su sesión en `state.json`. Si se interrumpe o reinicia con una po
 
 - **Nunca** invierte más del capital asignado (`CAPITAL_MAX`).
 - Cada posición abierta tiene obligatoriamente Stop-Loss y Take-Profit.
+- El SL se adapta a la volatilidad de cada par (no usa un valor fijo peligroso).
+- Filtra entradas cuando BTC está cayendo (evita altcoins en pánico).
+- Requiere confirmación de volumen en el retroceso (consolidación sana).
+- Cooldown entre trades del mismo par (evita re-entradas emocionales).
 - Respeta el límite de posiciones simultáneas (`--max-open`) y el tope de capital total.
 - Verifica el saldo disponible antes de comprar (usando la cantidad que alcance si es menor).
 - Descuenta la comisión de Binance (0.1% compra + 0.1% venta) en el cálculo de rentabilidad.
